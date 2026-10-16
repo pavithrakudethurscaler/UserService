@@ -1,5 +1,6 @@
 package com.ecom.users.services;
 
+import com.ecom.users.clients.NotificationPublisher;
 import com.ecom.users.exceptions.InvalidCredentialsException;
 import com.ecom.users.exceptions.InvalidTokenException;
 import com.ecom.users.exceptions.UserAlreadyExistsException;
@@ -19,6 +20,7 @@ import org.springframework.transaction.annotation.Transactional;
 import java.security.SecureRandom;
 import java.util.Base64;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 @Service
@@ -30,12 +32,13 @@ public class UserService {
     private final TokenRepo tokenRepo;
     private final PasswordResetTokenRepo passwordResetTokenRepo;
     private final BCryptPasswordEncoder passwordEncoder;
+    private final NotificationPublisher notificationPublisher;
     private final long tokenValidityMs;
     private final long resetTokenValidityMs;
     private final String resetLinkBaseUrl;
 
     public UserService(UserRepo userRepo, TokenRepo tokenRepo, PasswordResetTokenRepo passwordResetTokenRepo,
-                       BCryptPasswordEncoder passwordEncoder,
+                       BCryptPasswordEncoder passwordEncoder, NotificationPublisher notificationPublisher,
                        @Value("${auth.token.validity-ms:3600000}") long tokenValidityMs,
                        @Value("${auth.reset-token.validity-ms:900000}") long resetTokenValidityMs,
                        @Value("${auth.reset-link.base-url:http://localhost:8082/reset-password}") String resetLinkBaseUrl) {
@@ -43,6 +46,7 @@ public class UserService {
         this.tokenRepo = tokenRepo;
         this.passwordResetTokenRepo = passwordResetTokenRepo;
         this.passwordEncoder = passwordEncoder;
+        this.notificationPublisher = notificationPublisher;
         this.tokenValidityMs = tokenValidityMs;
         this.resetTokenValidityMs = resetTokenValidityMs;
         this.resetLinkBaseUrl = resetLinkBaseUrl;
@@ -61,7 +65,17 @@ public class UserService {
         user.setName(name);
         user.setEmail(normalizedEmail);
         user.setHashedPassword(passwordEncoder.encode(password));
-        return userRepo.save(user);
+        user = userRepo.save(user);
+
+        notificationPublisher.publish("user-" + user.getId() + "-registered", "USER_REGISTERED", Map.of(
+                "userId", user.getId(),
+                "email", user.getEmail(),
+                "name", user.getName() == null ? "" : user.getName()));
+        return user;
+    }
+
+    public Optional<User> findUser(Long id) {
+        return userRepo.findById(id);
     }
 
     public Token login(String email, String password) throws InvalidCredentialsException {
@@ -104,8 +118,9 @@ public class UserService {
     }
 
     /*
-     Creates a one-time reset token and "sends" the reset link.
+     Creates a one-time reset token and sends the reset link through the Notification Service.
      Does nothing for unknown emails, so callers cannot probe for registered emails.
+     The link is never written to this service's log.
      */
     public void requestPasswordReset(String email) {
         if (email == null || email.isBlank()) {
@@ -120,11 +135,16 @@ public class UserService {
         resetToken.setValue(randomTokenValue());
         resetToken.setExpiryAt(System.currentTimeMillis() + resetTokenValidityMs);
         resetToken.setUser(optionalUser.get());
-        passwordResetTokenRepo.save(resetToken);
+        resetToken = passwordResetTokenRepo.save(resetToken);
 
-        // TODO: publish a Kafka event for the Notification Service to email this link (HLD 3.1 / 3.6)
-        log.info("Password reset link for {}: {}?token={}", optionalUser.get().getEmail(),
-                resetLinkBaseUrl, resetToken.getValue());
+        User user = optionalUser.get();
+        notificationPublisher.publish("password-reset-" + resetToken.getId(), "PASSWORD_RESET_REQUESTED", Map.of(
+                "userId", user.getId(),
+                "email", user.getEmail(),
+                "name", user.getName() == null ? "" : user.getName(),
+                "resetLink", resetLinkBaseUrl + "?token=" + resetToken.getValue(),
+                "expiresAt", resetToken.getExpiryAt()));
+        log.info("Password reset requested for user {}", user.getId());
     }
 
     @Transactional
