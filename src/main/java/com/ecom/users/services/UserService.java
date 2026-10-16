@@ -3,33 +3,49 @@ package com.ecom.users.services;
 import com.ecom.users.exceptions.InvalidCredentialsException;
 import com.ecom.users.exceptions.InvalidTokenException;
 import com.ecom.users.exceptions.UserAlreadyExistsException;
+import com.ecom.users.models.PasswordResetToken;
 import com.ecom.users.models.Token;
 import com.ecom.users.models.User;
+import com.ecom.users.repos.PasswordResetTokenRepo;
 import com.ecom.users.repos.TokenRepo;
 import com.ecom.users.repos.UserRepo;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.security.SecureRandom;
 import java.util.Base64;
+import java.util.List;
 import java.util.Optional;
 
 @Service
 public class UserService {
+    private static final Logger log = LoggerFactory.getLogger(UserService.class);
     private static final SecureRandom RANDOM = new SecureRandom();
 
     private final UserRepo userRepo;
     private final TokenRepo tokenRepo;
+    private final PasswordResetTokenRepo passwordResetTokenRepo;
     private final BCryptPasswordEncoder passwordEncoder;
     private final long tokenValidityMs;
+    private final long resetTokenValidityMs;
+    private final String resetLinkBaseUrl;
 
-    public UserService(UserRepo userRepo, TokenRepo tokenRepo, BCryptPasswordEncoder passwordEncoder,
-                       @Value("${auth.token.validity-ms:3600000}") long tokenValidityMs) {
+    public UserService(UserRepo userRepo, TokenRepo tokenRepo, PasswordResetTokenRepo passwordResetTokenRepo,
+                       BCryptPasswordEncoder passwordEncoder,
+                       @Value("${auth.token.validity-ms:3600000}") long tokenValidityMs,
+                       @Value("${auth.reset-token.validity-ms:900000}") long resetTokenValidityMs,
+                       @Value("${auth.reset-link.base-url:http://localhost:8082/reset-password}") String resetLinkBaseUrl) {
         this.userRepo = userRepo;
         this.tokenRepo = tokenRepo;
+        this.passwordResetTokenRepo = passwordResetTokenRepo;
         this.passwordEncoder = passwordEncoder;
         this.tokenValidityMs = tokenValidityMs;
+        this.resetTokenValidityMs = resetTokenValidityMs;
+        this.resetLinkBaseUrl = resetLinkBaseUrl;
     }
 
     public User signUp(String name, String email, String password) throws UserAlreadyExistsException {
@@ -79,14 +95,71 @@ public class UserService {
         tokenRepo.save(token);
     }
 
-    private Token generateToken(User user) {
-        byte[] bytes = new byte[32];
-        RANDOM.nextBytes(bytes);
+    public User updateProfile(User user, String name) {
+        if (name == null || name.isBlank()) {
+            throw new IllegalArgumentException("Name is required");
+        }
+        user.setName(name.trim());
+        return userRepo.save(user);
+    }
 
+    /*
+     Creates a one-time reset token and "sends" the reset link.
+     Does nothing for unknown emails, so callers cannot probe for registered emails.
+     */
+    public void requestPasswordReset(String email) {
+        if (email == null || email.isBlank()) {
+            throw new IllegalArgumentException("Email is required");
+        }
+        Optional<User> optionalUser = userRepo.findByEmail(email.trim().toLowerCase());
+        if (optionalUser.isEmpty()) {
+            return;
+        }
+
+        PasswordResetToken resetToken = new PasswordResetToken();
+        resetToken.setValue(randomTokenValue());
+        resetToken.setExpiryAt(System.currentTimeMillis() + resetTokenValidityMs);
+        resetToken.setUser(optionalUser.get());
+        passwordResetTokenRepo.save(resetToken);
+
+        // TODO: publish a Kafka event for the Notification Service to email this link (HLD 3.1 / 3.6)
+        log.info("Password reset link for {}: {}?token={}", optionalUser.get().getEmail(),
+                resetLinkBaseUrl, resetToken.getValue());
+    }
+
+    @Transactional
+    public void resetPassword(String tokenValue, String newPassword) throws InvalidTokenException {
+        if (newPassword == null || newPassword.isBlank()) {
+            throw new IllegalArgumentException("New password is required");
+        }
+        PasswordResetToken resetToken = passwordResetTokenRepo
+                .findByValueAndDeletedAndExpiryAtGreaterThan(tokenValue, false, System.currentTimeMillis())
+                .orElseThrow(() -> new InvalidTokenException("Reset token is invalid or expired"));
+
+        User user = resetToken.getUser();
+        user.setHashedPassword(passwordEncoder.encode(newPassword));
+        userRepo.save(user);
+
+        resetToken.setDeleted(true);
+        passwordResetTokenRepo.save(resetToken);
+
+        // Log the user out everywhere, since the old password may have been compromised
+        List<Token> activeTokens = tokenRepo.findByUserAndDeleted(user, false);
+        activeTokens.forEach(token -> token.setDeleted(true));
+        tokenRepo.saveAll(activeTokens);
+    }
+
+    private Token generateToken(User user) {
         Token token = new Token();
-        token.setValue(Base64.getUrlEncoder().withoutPadding().encodeToString(bytes));
+        token.setValue(randomTokenValue());
         token.setExpiryAt(System.currentTimeMillis() + tokenValidityMs);
         token.setUser(user);
         return token;
+    }
+
+    private String randomTokenValue() {
+        byte[] bytes = new byte[32];
+        RANDOM.nextBytes(bytes);
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
     }
 }
