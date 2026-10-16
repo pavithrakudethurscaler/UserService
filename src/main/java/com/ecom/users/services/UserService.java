@@ -33,12 +33,14 @@ public class UserService {
     private final PasswordResetTokenRepo passwordResetTokenRepo;
     private final BCryptPasswordEncoder passwordEncoder;
     private final NotificationPublisher notificationPublisher;
+    private final RoleService roleService;
     private final long tokenValidityMs;
     private final long resetTokenValidityMs;
     private final String resetLinkBaseUrl;
 
     public UserService(UserRepo userRepo, TokenRepo tokenRepo, PasswordResetTokenRepo passwordResetTokenRepo,
                        BCryptPasswordEncoder passwordEncoder, NotificationPublisher notificationPublisher,
+                       RoleService roleService,
                        @Value("${auth.token.validity-ms:3600000}") long tokenValidityMs,
                        @Value("${auth.reset-token.validity-ms:900000}") long resetTokenValidityMs,
                        @Value("${auth.reset-link.base-url:http://localhost:8082/reset-password}") String resetLinkBaseUrl) {
@@ -47,6 +49,7 @@ public class UserService {
         this.passwordResetTokenRepo = passwordResetTokenRepo;
         this.passwordEncoder = passwordEncoder;
         this.notificationPublisher = notificationPublisher;
+        this.roleService = roleService;
         this.tokenValidityMs = tokenValidityMs;
         this.resetTokenValidityMs = resetTokenValidityMs;
         this.resetLinkBaseUrl = resetLinkBaseUrl;
@@ -65,6 +68,7 @@ public class UserService {
         user.setName(name);
         user.setEmail(normalizedEmail);
         user.setHashedPassword(passwordEncoder.encode(password));
+        roleService.assignSignupRoles(user);
         user = userRepo.save(user);
 
         notificationPublisher.publish("user-" + user.getId() + "-registered", "USER_REGISTERED", Map.of(
